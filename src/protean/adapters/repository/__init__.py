@@ -17,6 +17,7 @@ DATABASE_PROVIDERS = {
     "postgresql": "protean.adapters.repository.sqlalchemy.PostgresqlProvider",
     "sqlite": "protean.adapters.repository.sqlalchemy.SqliteProvider",
     "elasticsearch": "protean.adapters.repository.elasticsearch.ESProvider",
+    "cosmosdb": "protean.adapters.repository.cosmosdb.CosmosDBProvider",
 }
 
 

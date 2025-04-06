@@ -43,6 +43,7 @@ class Database(Enum):
     memory = "memory"
     postgresql = "postgresql"
     sqlite = "sqlite"
+    cosmosdb = "cosmosdb"
 
 
 class Cache(Enum):
