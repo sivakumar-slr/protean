@@ -348,7 +348,7 @@ class CosmosDBDAO(BaseDAO):
             ))
 
             # Get total count for pagination
-            count_query = "SELECT COUNT(1) FROM c"
+            count_query = "SELECT VALUE COUNT(1) FROM c"
             if criteria.children:
                 count_query = f"{count_query} WHERE {where_clause}"
             
