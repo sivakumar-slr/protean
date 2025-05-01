@@ -40,7 +40,7 @@ class CosmosDBModel(BaseModel):
     @classmethod
     def to_entity(cls, item: "CosmosDBModel"):
         """Convert the dictionary record to an entity"""
-        keys_to_remove = {"_rid", "_ts", "_etag"}
+        keys_to_remove = {"_rid", "_ts", "_etag", "_self", "_attachments"}
         item = {k: v for k, v in item.items() if k not in keys_to_remove}
         return cls.meta_.part_of(**item)
 
