@@ -1,20 +1,57 @@
 """Module containing repository implementation for CosmosDB"""
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
 from typing import Any
-from protean.utils.query import Q
-from protean.core.queryset import ResultSet
-from datetime import datetime
+from uuid import UUID
 
-from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos import CosmosClient, PartitionKey, exceptions
 from protean.core.model import BaseModel
+from protean.core.queryset import ResultSet
 from protean.port.dao import BaseDAO
 from protean.port.provider import BaseProvider
 from protean.utils.container import Options
+from protean.utils.query import Q
 from protean.utils.reflection import attributes
 
 
 logger = logging.getLogger(__name__)
+
+_BULK_QUERY_BATCH = 100  # Max ids fetched per query round before patching/deleting.
+_PATCH_MAX_RETRIES = 3
+_TRANSIENT_COSMOS_STATUS = {408, 429, 449, 500, 503}
+
+
+def _build_patch_ops(values: dict) -> list:
+    """Build Cosmos patch ops; use remove (not set null) for None values."""
+    ops = []
+    for field, value in _jsonify(values).items():
+        if value is None:
+            ops.append({"op": "remove", "path": f"/{field}"})
+        else:
+            ops.append({"op": "set", "path": f"/{field}", "value": value})
+    return ops
+
+
+def _jsonify(value: Any) -> Any:
+    """Convert patch values to Cosmos-safe JSON (enums, datetimes, UUIDs, etc.)."""
+    if isinstance(value, dict):
+        return {key: _jsonify(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(item) for item in value]
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Enum):
+        return value.value
+    return value
 
 def derive_schema_name(model_cls):
     if hasattr(model_cls.meta_, "schema_name") and model_cls.meta_.schema_name:
@@ -61,6 +98,8 @@ class CosmosDBProvider(BaseProvider):
 
         # A temporary cache of already constructed model classes
         self._model_classes = {}
+        # Parallel patch/delete workers; set bulk_concurrency in database config if needed.
+        self._bulk_concurrency = int(conn_info.get("bulk_concurrency", 16))
 
     def get_connection(self):
         """Get the connection object for the repository"""
@@ -228,13 +267,134 @@ class CosmosDBDAO(BaseDAO):
         """
         raise NotImplementedError
 
-    def _update_all(self, criteria: Q, *args, **kwargs):
-        """Run raw query on Data source.
+    def _container(self):
+        conn = self.provider.get_connection()
+        return conn.get_container_client(derive_schema_name(self.model_cls))
 
-        Running a raw query on the data store should always returns entity instance objects. If
-        the results were not synthesizable back into entity objects, an exception should be thrown.
+    def _query_parameters(self, params):
+        return [{"name": key, "value": value} for key, value in params.items()]
+
+    def _matched_keys(self, criteria: Q, limit: int = _BULK_QUERY_BATCH):
+        """Return (id, partition_key) pairs matching criteria — ids only, not full documents."""
+        if not criteria.children:
+            return []
+
+        where_clause, params = self._build_filters(criteria)
+        batch_params = dict(params)
+        batch_params["@limit"] = limit
+        sql = f"SELECT c.id FROM c WHERE {where_clause} OFFSET 0 LIMIT @limit"
+        items = list(
+            self._container().query_items(
+                query=sql,
+                parameters=self._query_parameters(batch_params),
+                enable_cross_partition_query=True,
+            )
+        )
+        return [(item["id"], item["id"]) for item in items]
+
+    def _bulk_execute(self, keys, op) -> int:
+        """Run op(key) concurrently; skip not-found, raise on first other Cosmos error."""
+        if not keys:
+            return 0
+
+        count = 0
+        errors = []
+        with ThreadPoolExecutor(max_workers=self.provider._bulk_concurrency) as pool:
+            futures = [pool.submit(op, key) for key in keys]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                    count += 1
+                except exceptions.CosmosResourceNotFoundError:
+                    pass
+                except exceptions.CosmosHttpResponseError as exc:
+                    errors.append(exc)
+
+        if errors:
+            raise errors[0]
+        return count
+
+    def _patch_or_replace(self, container, key, values: dict):
+        """Patch fields with retries; fall back to read-modify-replace if patch keeps failing."""
+        item_id, partition_key = key
+        patch_ops = _build_patch_ops(values)
+        patch_chunks = [
+            patch_ops[index : index + 10] for index in range(0, len(patch_ops), 10)
+        ]
+        delay = 0.05
+
+        for attempt in range(_PATCH_MAX_RETRIES):
+            try:
+                for chunk in patch_chunks:
+                    container.patch_item(
+                        item=item_id,
+                        partition_key=partition_key,
+                        patch_operations=chunk,
+                        no_response=True,
+                    )
+                return
+            except exceptions.CosmosHttpResponseError as exc:
+                status = getattr(exc, "status_code", None)
+                if status not in _TRANSIENT_COSMOS_STATUS or attempt == _PATCH_MAX_RETRIES - 1:
+                    break
+                time.sleep(delay)
+                delay *= 2
+
+        doc = container.read_item(item=item_id, partition_key=partition_key)
+        for field, value in _jsonify(values).items():
+            if value is None:
+                doc.pop(field, None)
+            else:
+                doc[field] = value
+        container.replace_item(item=item_id, body=doc)
+
+    def _update_all(self, criteria: Q, *args, **kwargs):
+        """Bulk patch items matching criteria without loading full documents.
+
+        Uses patch_item (partial update) instead of replace_item. Processes in
+        batches of _BULK_QUERY_BATCH until no matching ids remain.
         """
-        raise NotImplementedError
+        values = {}
+        if args:
+            values.update(args[0])
+        values.update(kwargs)
+        if not values:
+            return 0
+
+        container = self._container()
+        total_updated = 0
+
+        def patch_key(key):
+            self._patch_or_replace(container, key, values)
+
+        while True:
+            keys = self._matched_keys(criteria)
+            if not keys:
+                break
+            total_updated += self._bulk_execute(keys, patch_key)
+            if len(keys) < _BULK_QUERY_BATCH:
+                break
+
+        return total_updated
+
+    def _delete_all(self, criteria: Q = None):
+        """Bulk delete items matching criteria in batches of _BULK_QUERY_BATCH."""
+        criteria = criteria or Q()
+        container = self._container()
+        total_deleted = 0
+
+        def delete_key(key):
+            container.delete_item(item=key[0], partition_key=key[1])
+
+        while True:
+            keys = self._matched_keys(criteria)
+            if not keys:
+                break
+            total_deleted += self._bulk_execute(keys, delete_key)
+            if len(keys) < _BULK_QUERY_BATCH:
+                break
+
+        return total_deleted
 
     def _build_filters(self, criteria: Q):
         """Recursively Build the filters from the criteria object into CosmosDB SQL query"""
@@ -378,14 +538,6 @@ class CosmosDBDAO(BaseDAO):
             raise
         return result
 
-
-    def _delete_all(self, criteria: Q = None):
-        """Run raw query on Data source.
-
-        Running a raw query on the data store should always returns entity instance objects. If
-        the results were not synthesizable back into entity objects, an exception should be thrown.
-        """
-        raise NotImplementedError    
 
 class CosmosDBSession:
     """A Session wrapper for Cosmosdb Database.
